@@ -2,18 +2,14 @@ import os
 import json
 import logging
 import smtplib
-from datetime import datetime, time
 from email.message import EmailMessage
-from typing import Any, Dict, List
-
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
 
 import requests
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient
-from azure.core.exceptions import ResourceExistsError
 
-# Starting the function app
+# starting the function
 app = func.FunctionApp()
 
 LIST_URL = (
@@ -24,7 +20,7 @@ MESSAGE_URL = (
     "https://api3.oslo.oslobors.no/v1/newsreader/message?messageId={message_id}"
 )
 
-# Headers for the API call to Oslo Børs
+# Headers for the api call to oslo børs
 DEFAULT_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
@@ -33,32 +29,18 @@ DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
 }
 
-# State blob location (set via env vars, with sane defaults)
 STATE_CONTAINER = os.environ.get("STATE_CONTAINER", "state")
 STATE_BLOB_NAME = os.environ.get("STATE_BLOB_NAME", "insider-alerts.json")
-
-# Quiet hours (Oslo time): 00:00–05:00
-OSLO_TZ = ZoneInfo("Europe/Oslo")
-QUIET_START = time(0, 0)
-QUIET_END = time(5, 0)
-
-
-def in_quiet_hours() -> bool:
-    now_local = datetime.now(OSLO_TZ).time()
-    return QUIET_START <= now_local < QUIET_END
 
 
 def _blob_client():
     conn_str = os.environ["BLOB_CONN_STR"]
     svc = BlobServiceClient.from_connection_string(conn_str)
     container = svc.get_container_client(STATE_CONTAINER)
-
-    # Create container if it doesn't exist
     try:
         container.create_container()
-    except ResourceExistsError:
+    except Exception:
         pass
-
     return container.get_blob_client(STATE_BLOB_NAME)
 
 
@@ -94,7 +76,8 @@ def fetch_message(message_id: int) -> Dict[str, Any]:
     r = requests.post(url, headers=DEFAULT_HEADERS, data=b"", timeout=20)
     r.raise_for_status()
     payload = r.json()
-    return payload.get("data", {}).get("message", {}) or {}
+    msg = payload.get("data", {}).get("message", {})
+    return msg
 
 
 def send_email(subject: str, body: str) -> None:
@@ -103,9 +86,8 @@ def send_email(subject: str, body: str) -> None:
     smtp_user = os.environ["SMTP_USER"]
     smtp_pass = os.environ["SMTP_PASS"]
     mail_from = os.environ["MAIL_FROM"]
-
     mail_to = os.environ["MAIL_TO"]
-    recipients = [addr.strip() for addr in mail_to.split(",") if addr.strip()]
+    recipients = [addr.strip() for addr in mail_to.split(",")]
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -122,16 +104,9 @@ def send_email(subject: str, body: str) -> None:
 @app.timer_trigger(schedule="0 */2 * * * *", arg_name="mytimer", run_on_startup=False)
 def poll_insider_trades(mytimer: func.TimerRequest) -> None:
     """
-    Runs every 2 minutes by default (UTC-based trigger schedule).
-    Quiet hours are enforced in code using Europe/Oslo local time.
-
-    Cron format here is NCRONTAB:
-      {sec} {min} {hour} {day} {month} {day-of-week}
+    Runs every 2 minutes by default.
+    Cron format here is NCRONTAB: {sec} {min} {hour} {day} {month} {day-of-week}
     """
-    if in_quiet_hours():
-        logging.info("Quiet hours (00:00–05:00 Oslo). Skipping poll.")
-        return
-
     logging.info("Poll started")
 
     state = load_state()
@@ -164,9 +139,10 @@ def poll_insider_trades(mytimer: func.TimerRequest) -> None:
 
         # Fetch full message body
         full = fetch_message(mid)
-        body_text = (full.get("body") or "").strip()
+        body_text = full.get("body", "").strip()
 
-        email_subject = f"Insider trade alert: {issuer_sign} - {title}".strip(" -")
+        # Make a decent email body
+        email_subject = f"[Insider trade] {issuer_sign} - {title}".strip(" -")
         email_body = (
             f"{title}\n"
             f"Issuer: {issuer} ({issuer_sign})\n"
