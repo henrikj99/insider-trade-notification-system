@@ -1,13 +1,13 @@
 import os
 import json
 import logging
-import smtplib
-from email.message import EmailMessage
 from typing import Any, Dict, List
 
 import requests
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # starting the function
 app = func.FunctionApp()
@@ -97,27 +97,31 @@ def fetch_message(message_id: int) -> Dict[str, Any]:
 
 
 def send_email(subject: str, body: str) -> None:
-    smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ["SMTP_USER"]
-    smtp_pass = os.environ["SMTP_PASS"]
+    """Send email using SendGrid Web API"""
+    api_key = os.environ["SENDGRID_API_KEY"]
     mail_from = os.environ["MAIL_FROM"]
     mail_to = os.environ["MAIL_TO"]
     recipients = [addr.strip() for addr in mail_to.split(",")]
 
-    logging.info("Sending email to %s", recipients)
+    logging.info("Sending email to %s via SendGrid API", recipients)
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = mail_from
-    msg["To"] = recipients
-    msg.set_content(body)
+    # Create the email message
+    message = Mail(
+        from_email=mail_from,
+        to_emails=recipients,
+        subject=subject,
+        plain_text_content=body
+    )
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
-            s.starttls()
-            s.login(smtp_user, smtp_pass)
-            s.send_message(msg)
+        sg = SendGridAPIClient(api_key)
+        response = sg.send(message)
+        logging.info("SendGrid response status: %d", response.status_code)
+        
+        if response.status_code >= 400:
+            logging.error("SendGrid error: %s", response.body)
+            raise Exception(f"SendGrid returned status {response.status_code}")
+        
         logging.info("Email sent successfully")
     except Exception as e:
         logging.error("Failed to send email: %s", str(e))
@@ -127,7 +131,7 @@ def send_email(subject: str, body: str) -> None:
 @app.timer_trigger(schedule="0 */10 * * * *", arg_name="mytimer", run_on_startup=False)
 def poll_insider_trades(mytimer: func.TimerRequest) -> None:
     """
-    Runs every 2 minutes by default.
+    Runs every 10 minutes.
     Cron format here is NCRONTAB: {sec} {min} {hour} {day} {month} {day-of-week}
     """
     logging.info("Poll started")
