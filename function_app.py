@@ -3,7 +3,7 @@ import json
 import logging
 import smtplib
 from email.message import EmailMessage
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
 import azure.functions as func
@@ -65,19 +65,35 @@ def save_state(state: Dict[str, Any]) -> None:
 
 
 def fetch_list() -> List[Dict[str, Any]]:
-    r = requests.post(LIST_URL, headers=DEFAULT_HEADERS, data=b"", timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-    return payload.get("data", {}).get("messages", []) or []
+    logging.info("Calling Oslo Børs API at %s", LIST_URL)
+    try:
+        r = requests.post(LIST_URL, headers=DEFAULT_HEADERS, data=b"", timeout=20)
+        logging.info("Oslo Børs API response status: %d", r.status_code)
+        r.raise_for_status()
+        payload = r.json()
+        messages = payload.get("data", {}).get("messages", []) or []
+        logging.info("Fetched %d messages from Oslo Børs", len(messages))
+        return messages
+    except requests.exceptions.RequestException as e:
+        logging.error("Oslo Børs API request failed: %s", str(e))
+        raise
+    except Exception as e:
+        logging.error("Error parsing Oslo Børs response: %s", str(e))
+        raise
 
 
 def fetch_message(message_id: int) -> Dict[str, Any]:
     url = MESSAGE_URL.format(message_id=message_id)
-    r = requests.post(url, headers=DEFAULT_HEADERS, data=b"", timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-    msg = payload.get("data", {}).get("message", {})
-    return msg
+    logging.info("Fetching message details for ID %d", message_id)
+    try:
+        r = requests.post(url, headers=DEFAULT_HEADERS, data=b"", timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        msg = payload.get("data", {}).get("message", {})
+        return msg
+    except Exception as e:
+        logging.error("Failed to fetch message %d: %s", message_id, str(e))
+        raise
 
 
 def send_email(subject: str, body: str) -> None:
@@ -89,16 +105,23 @@ def send_email(subject: str, body: str) -> None:
     mail_to = os.environ["MAIL_TO"]
     recipients = [addr.strip() for addr in mail_to.split(",")]
 
+    logging.info("Sending email to %s", recipients)
+
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = mail_from
     msg["To"] = recipients
     msg.set_content(body)
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
-        s.starttls()
-        s.login(smtp_user, smtp_pass)
-        s.send_message(msg)
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+        logging.info("Email sent successfully")
+    except Exception as e:
+        logging.error("Failed to send email: %s", str(e))
+        raise
 
 
 @app.timer_trigger(schedule="0 */2 * * * *", arg_name="mytimer", run_on_startup=False)
@@ -109,58 +132,68 @@ def poll_insider_trades(mytimer: func.TimerRequest) -> None:
     """
     logging.info("Poll started")
 
-    state = load_state()
-    last_id = int(state.get("last_processed_message_id", 0))
-    logging.info("Last processed messageId: %s", last_id)
+    try:
+        state = load_state()
+        last_id = int(state.get("last_processed_message_id", 0))
+        logging.info("Last processed messageId: %s", last_id)
 
-    messages = fetch_list()
+        messages = fetch_list()
 
-    # Collect new messageIds
-    new_items = []
-    for m in messages:
-        mid = int(m.get("messageId") or m.get("id") or 0)
-        if mid > last_id:
-            new_items.append(m)
+        # Collect new messageIds
+        new_items = []
+        for m in messages:
+            mid = int(m.get("messageId") or m.get("id") or 0)
+            if mid > last_id:
+                new_items.append(m)
 
-    if not new_items:
-        logging.info("No new disclosures")
-        return
+        if not new_items:
+            logging.info("No new disclosures")
+            return
 
-    # Process in ascending order so state advances correctly
-    new_items.sort(key=lambda x: int(x.get("messageId") or x.get("id") or 0))
+        logging.info("Found %d new disclosures to process", len(new_items))
 
-    newest_processed = last_id
+        # Process in ascending order so state advances correctly
+        new_items.sort(key=lambda x: int(x.get("messageId") or x.get("id") or 0))
 
-    for item in new_items:
-        mid = int(item.get("messageId") or item.get("id") or 0)
-        title = item.get("title", "(no title)")
-        issuer = item.get("issuerName", "")
-        issuer_sign = item.get("issuerSign", "")
+        newest_processed = last_id
 
-        # Fetch full message body
-        full = fetch_message(mid)
-        body_text = full.get("body", "").strip()
+        for item in new_items:
+            mid = int(item.get("messageId") or item.get("id") or 0)
+            title = item.get("title", "(no title)")
+            issuer = item.get("issuerName", "")
+            issuer_sign = item.get("issuerSign", "")
 
-        # Make a decent email body
-        email_subject = f"[Insider trade] {issuer_sign} - {title}".strip(" -")
-        email_body = (
-            f"{title}\n"
-            f"Issuer: {issuer} ({issuer_sign})\n"
-            f"Published: {full.get('publishedTime','')}\n"
-            f"MessageId: {mid}\n\n"
-            f"{body_text}\n"
+            logging.info("Processing message %d: %s", mid, title)
+
+            # Fetch full message body
+            full = fetch_message(mid)
+            body_text = full.get("body", "").strip()
+
+            # Make a decent email body
+            email_subject = f"[Insider trade] {issuer_sign} - {title}".strip(" -")
+            email_body = (
+                f"{title}\n"
+                f"Issuer: {issuer} ({issuer_sign})\n"
+                f"Published: {full.get('publishedTime','')}\n"
+                f"MessageId: {mid}\n\n"
+                f"{body_text}\n"
+            )
+
+            # Send email; only advance state if send succeeds
+            send_email(email_subject, email_body)
+            logging.info("Sent email for messageId %s", mid)
+
+            newest_processed = max(newest_processed, mid)
+
+        # Persist the newest messageId we successfully handled
+        state["last_processed_message_id"] = newest_processed
+        save_state(state)
+
+        logging.info(
+            "Poll finished. Updated last_processed_message_id=%s", newest_processed
         )
 
-        # Send email; only advance state if send succeeds
-        send_email(email_subject, email_body)
-        logging.info("Sent email for messageId %s", mid)
-
-        newest_processed = max(newest_processed, mid)
-
-    # Persist the newest messageId we successfully handled
-    state["last_processed_message_id"] = newest_processed
-    save_state(state)
-
-    logging.info(
-        "Poll finished. Updated last_processed_message_id=%s", newest_processed
-    )
+    except Exception as e:
+        logging.error("Function failed with error: %s", str(e))
+        logging.exception("Full traceback:")
+        raise
