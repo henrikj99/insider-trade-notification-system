@@ -124,7 +124,7 @@ def send_email(subject: str, body: str) -> None:
         raise
 
 
-@app.timer_trigger(schedule="0 */2 * * * *", arg_name="mytimer", run_on_startup=False)
+@app.timer_trigger(schedule="0 */10 * * * *", arg_name="mytimer", run_on_startup=False)
 def poll_insider_trades(mytimer: func.TimerRequest) -> None:
     """
     Runs every 2 minutes by default.
