@@ -3,3 +3,4 @@ azure-storage-blob
 requests
 tzdata
 cryptography==41.0.7
+sendgrid
